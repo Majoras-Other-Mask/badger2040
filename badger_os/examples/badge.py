@@ -1,6 +1,7 @@
 import badger2040
 import jpegdec
 import pngdec
+import qrcode
 import os
 import badger_os
 
@@ -132,12 +133,28 @@ def load_all_badges():
 #      Drawing functions
 # ------------------------------
 
+def is_url(text):
+    """Check if the text appears to be a URL"""
+    text = text.strip().lower()
+    return (text.startswith('http://') or 
+            text.startswith('https://') or 
+            text.startswith('www.') or
+            # Also support common domains without protocol
+            any(text.startswith(domain) for domain in [
+                'github.com', 'linkedin.com', 'twitter.com', 'x.com',
+                'facebook.com', 'instagram.com', 'youtube.com'
+            ]))
+
 def has_valid_image(badge_data):
-    """Check if the badge has a valid image file"""
+    """Check if the badge has a valid image file (not a URL)"""
     image_path = badge_data.get('badge_image', '').strip()
     
     # No image path provided or empty
     if not image_path:
+        return False
+    
+    # If it's a URL, we'll handle it as a QR code instead
+    if is_url(image_path):
         return False
     
     # Check if file exists
@@ -148,6 +165,44 @@ def has_valid_image(badge_data):
     except OSError:
         return False
 
+def has_qr_content(badge_data):
+    """Check if the badge should display a QR code"""
+    image_path = badge_data.get('badge_image', '').strip()
+    return bool(image_path) and is_url(image_path)
+
+def draw_qr_code(url, x, y, size):
+    """Draw a QR code for the given URL"""
+    try:
+        code = qrcode.QRCode()
+        code.set_text(url)
+        
+        # Calculate module size to fit within the given size
+        w, h = code.get_size()
+        module_size = min(size // w, size // h)
+        actual_size = module_size * w
+        
+        # Center the QR code in the available space
+        offset_x = (size - actual_size) // 2
+        offset_y = (size - actual_size) // 2
+        
+        # Clear the background
+        display.set_pen(15)  # White
+        display.rectangle(x, y, size, size)
+        
+        # Draw the QR code
+        display.set_pen(0)  # Black
+        for qr_x in range(w):
+            for qr_y in range(h):
+                if code.get_module(qr_x, qr_y):
+                    pixel_x = x + offset_x + (qr_x * module_size)
+                    pixel_y = y + offset_y + (qr_y * module_size)
+                    display.rectangle(pixel_x, pixel_y, module_size, module_size)
+        
+        return True
+    except Exception as e:
+        print(f"Error generating QR code: {e}")
+        return False
+
 def draw_badge():
     """Draw the current badge"""
     if not badges:
@@ -155,9 +210,11 @@ def draw_badge():
     
     current_badge = badges[state["current_badge"]]
     has_image = has_valid_image(current_badge)
+    has_qr = has_qr_content(current_badge)
+    has_visual_element = has_image or has_qr
     
-    # Determine text width based on whether we have an image
-    if has_image:
+    # Determine text width based on whether we have an image or QR code
+    if has_visual_element:
         available_text_width = TEXT_WIDTH
         name_available_width = TEXT_WIDTH - NAME_PADDING
     else:
@@ -167,28 +224,43 @@ def draw_badge():
     display.set_pen(0)
     display.clear()
 
-    # Draw image only if it exists and is valid
-    if has_image:
-        try:
-            # Try PNG first, then JPEG
+    # Draw image or QR code if we have one
+    if has_visual_element:
+        visual_drawn = False
+        
+        if has_image:
             try:
-                png.open_file(current_badge['badge_image'])
-                png.decode(WIDTH - IMAGE_WIDTH, 0)
+                # Try PNG first, then JPEG
+                try:
+                    png.open_file(current_badge['badge_image'])
+                    png.decode(WIDTH - IMAGE_WIDTH, 0)
+                    visual_drawn = True
+                except (OSError, RuntimeError):
+                    jpeg.open_file(current_badge['badge_image'])
+                    jpeg.decode(WIDTH - IMAGE_WIDTH, 0)
+                    visual_drawn = True
             except (OSError, RuntimeError):
-                jpeg.open_file(current_badge['badge_image'])
-                jpeg.decode(WIDTH - IMAGE_WIDTH, 0)
-            
-            # Draw a border around the image area
+                print(f"Failed to load image: {current_badge['badge_image']}")
+        
+        elif has_qr:
+            # Draw QR code
+            qr_size = min(IMAGE_WIDTH, HEIGHT)
+            qr_x = WIDTH - IMAGE_WIDTH + ((IMAGE_WIDTH - qr_size) // 2)
+            qr_y = (HEIGHT - qr_size) // 2
+            visual_drawn = draw_qr_code(current_badge['badge_image'], qr_x, qr_y, qr_size)
+        
+        # If we failed to draw either image or QR, fall back to full-width text
+        if not visual_drawn:
+            has_visual_element = False
+            available_text_width = WIDTH - (LEFT_PADDING * 2)
+            name_available_width = WIDTH - (LEFT_PADDING * 2)
+        else:
+            # Draw a border around the visual area
             display.set_pen(0)
             display.line(WIDTH - IMAGE_WIDTH, 0, WIDTH - 1, 0)
             display.line(WIDTH - IMAGE_WIDTH, 0, WIDTH - IMAGE_WIDTH, HEIGHT - 1)
             display.line(WIDTH - IMAGE_WIDTH, HEIGHT - 1, WIDTH - 1, HEIGHT - 1)
             display.line(WIDTH - 1, 0, WIDTH - 1, HEIGHT - 1)
-        except (OSError, RuntimeError):
-            # Image failed to load, treat as no image
-            has_image = False
-            available_text_width = WIDTH - (LEFT_PADDING * 2)
-            name_available_width = WIDTH - (LEFT_PADDING * 2)
 
     # Draw the company
     display.set_pen(15)  # White background
@@ -197,7 +269,7 @@ def draw_badge():
     display.text(company_text, LEFT_PADDING, (COMPANY_HEIGHT // 2) + 1, WIDTH, COMPANY_TEXT_SIZE)
 
     # Draw a white background behind the name
-    name_bg_width = available_text_width if not has_image else TEXT_WIDTH
+    name_bg_width = available_text_width if not has_visual_element else TEXT_WIDTH
     display.set_pen(15)
     display.rectangle(1, COMPANY_HEIGHT + 1, name_bg_width, NAME_HEIGHT)
 
@@ -212,7 +284,7 @@ def draw_badge():
             name_size -= 0.01
         else:
             # Center the name in the available space
-            if has_image:
+            if has_visual_element:
                 x_pos = (TEXT_WIDTH - name_length) // 2
             else:
                 x_pos = (WIDTH - name_length) // 2
@@ -220,7 +292,7 @@ def draw_badge():
             break
 
     # Draw white backgrounds behind the details
-    details_bg_width = available_text_width if not has_image else TEXT_WIDTH
+    details_bg_width = available_text_width if not has_visual_element else TEXT_WIDTH
     display.set_pen(15)
     display.rectangle(1, HEIGHT - DETAILS_HEIGHT * 2, details_bg_width, DETAILS_HEIGHT - 1)
     display.rectangle(1, HEIGHT - DETAILS_HEIGHT, details_bg_width, DETAILS_HEIGHT - 1)
